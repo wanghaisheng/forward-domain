@@ -7,6 +7,7 @@ import forge from "node-forge";
 const recordParamDestUrl = 'forward-domain';
 const recordParamHttpStatus = 'http-status';
 const caaRegex = /^0 issue (")?letsencrypt\.org(;validationmethods=http-01)?\1$/;
+
 /**
  * @type {Record<string, boolean>}
  */
@@ -30,6 +31,17 @@ let blacklistMap = null;
  * @type {Record<string, boolean> | null}
  */
 let whitelistMap = null;
+/**
+ * @type {number | null}
+ */
+let cacheExpirySeconds = null;
+
+export function getExpiryDate() {
+    if (cacheExpirySeconds === null) {
+        cacheExpirySeconds = parseInt(process.env.CACHE_EXPIRY_SECONDS || '86400')
+    }
+    return Date.now() + cacheExpirySeconds * 1000;
+}
 
 /**
  * @returns {Record<string, any>}
@@ -73,6 +85,17 @@ function csvToMap(str) {
         }
         return acc;
     }, initMap())
+}
+
+/**
+* @return {void}
+*/
+export function clearConfig() {
+    whitelistMap = null;
+    blacklistMap = null;
+    useLocalDNS = null;
+    blacklistRedirectUrl = null;
+    cacheExpirySeconds = null;
 }
 
 /**
@@ -180,13 +203,10 @@ export async function validateCAARecords(host, mockResolve = undefined) {
         useLocalDNS = process.env.USE_LOCAL_DNS == 'true';
     }
     let issueRecords;
-    if (useLocalDNS) {
-        const records = await dns.resolveCaa(host);
-        if (!records || records.length === 0) {
-            return null;
-        }
+    if (useLocalDNS && !mockResolve) {
+        const records = mockResolve || await dns.resolveCaa(host).catch(() => null);
+        issueRecords = (records || []).filter(record => record.issue).map(record => `0 issue "${record.issue}"`);
 
-        issueRecords = records.filter(record => record.issue).map(record => `0 issue "${record.issue}"`)
     } else {
         /**
          * @type {{data: {Answer: {data: string, type: number}[]}}}
@@ -218,26 +238,34 @@ export async function findTxtRecord(host, mockResolve = undefined) {
     if (useLocalDNS === null) {
         useLocalDNS = process.env.USE_LOCAL_DNS == 'true';
     }
-    if (useLocalDNS) {
-        const resolve = await dns.resolveTxt(`_.${host}`);
-        for (const record of resolve) {
-            const joinedRecord = record.join(';');
-            const txtData = parseTxtRecordData(joinedRecord);
-            if (!txtData[recordParamDestUrl]) continue;
-            return {
-                url: txtData[recordParamDestUrl],
-                httpStatus: txtData[recordParamHttpStatus],
-            };
+    if (useLocalDNS && !mockResolve) {
+        const resolvePromises = [
+            dns.resolveTxt(`_.${host}`),
+            dns.resolveTxt(`fwd.${host}`)
+        ];
+    
+        const resolved = await Promise.any(resolvePromises).catch(() => null);
+    
+        if (resolved) {
+            for (const record of resolved) {
+                const joinedRecord = record.join(';');
+                const txtData = parseTxtRecordData(joinedRecord);
+                if (!txtData[recordParamDestUrl]) continue;
+                return {
+                    url: txtData[recordParamDestUrl],
+                    httpStatus: txtData[recordParamHttpStatus],
+                };
+            }
         }
     } else {
         /**
-         * @type {{data: {Answer: {data: string, type: number}[]}}}
+         * @type {{data: string, type: number}[]}
          */
-        const resolve = mockResolve || await request(`https://dns.google/resolve?name=_.${encodeURIComponent(host)}&type=TXT`);
-        if (!resolve.data.Answer) {
-            return null;
-        }
-        for (const head of resolve.data.Answer) {
+        const resolve = mockResolve ? mockResolve.data.Answer : [
+            ...(await request(`https://dns.google/resolve?name=_.${encodeURIComponent(host)}&type=TXT`)).data.Answer || [],
+            ...(await request(`https://dns.google/resolve?name=fwd.${encodeURIComponent(host)}&type=TXT`)).data.Answer || [],
+        ];
+        for (const head of resolve) {
             if (head.type !== 16) { // RR type of TXT is 16
                 continue;
             }

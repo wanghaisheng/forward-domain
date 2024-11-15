@@ -11,7 +11,8 @@ import {
     isExceedLabelLimit,
     validateCAARecords,
     isExceedHostLimit,
-    isHttpCodeAllowed
+    isHttpCodeAllowed,
+    getExpiryDate
 } from "./util.js";
 
 const MAX_DATA_SIZE = 10 * 1024; // 10 KB
@@ -28,11 +29,6 @@ const MAX_DATA_SIZE = 10 * 1024; // 10 KB
  * @type {LRUCache<string, Cache>}
  */
 let resolveCache = new LRUCache({ max: 10000 });
-
-/**
- * @type {int | 86400}
- */
-const cacheExpirySeconds = parseInt(process.env.CACHE_EXPIRY_SECONDS, 10) || 86400;
 
 function pruneCache() {
     resolveCache = new LRUCache({ max: 10000 });
@@ -63,11 +59,11 @@ async function buildCache(host) {
     let expand = false;
     let recordData = await findTxtRecord(host);
     if (!recordData) {
-        throw new Error(`The TXT record data for "_.${host}" is missing`);
+        throw new Error(`The TXT record data for "_.${host}" or "fwd.${host}" is missing`);
     }
-    let { url, httpStatus = '301' } = recordData;
+    let { url, httpStatus = '302' } = recordData;
     if (url.indexOf('http://') !== 0 && url.indexOf('https://') !== 0) {
-        throw new Error(`The TXT record data for "_.${host}" is not an absolute URL`);
+        throw new Error(`The TXT record data for "_.${host}" or "fwd.${host}" is not an absolute URL`);
     }
     if (url.endsWith('*')) {
         url = url.slice(0, -1);
@@ -80,7 +76,7 @@ async function buildCache(host) {
         url,
         expand,
         blacklisted: isHostBlacklisted(host),
-        expire: Date.now() + cacheExpirySeconds * 1000,
+        expire: getExpiryDate(),
         httpStatus: parseInt(httpStatus),
     };
 }
@@ -133,45 +129,45 @@ const listener = async function (req, res) {
                     res.write("ok");
                     return;
                 case '/flushcache':
-                    if (req.method === 'POST') {
-                        let body = '';
-                        let totalSize = 0;
+                    if (req.method !== 'POST') {
+                        res.writeHead(405, { 'Content-Type': 'text/plain' });
+                        res.write("Method Not Allowed");
+                        return;
+                    }
+                    let body = '';
+                    let totalSize = 0;
 
-                        req.on('data', chunk => {
-                            totalSize += chunk.length;
-                            // Disconnect if the data stream is too large
-                            if (totalSize > MAX_DATA_SIZE) {
-                                req.destroy();
+                    req.on('data', chunk => {
+                        totalSize += chunk.length;
+                        // Disconnect if the data stream is too large
+                        if (totalSize > MAX_DATA_SIZE) {
+                            req.destroy();
+                            return;
+                        }
+
+                        body += chunk.toString();
+                    });
+
+                    req.on('end', () => {
+                        if (totalSize <= MAX_DATA_SIZE) {
+                            const parsedData = querystring.parse(body);
+                            const domain = parsedData.domain;
+
+                            if (!domain || typeof domain !== 'string') {
                                 return;
                             }
 
-                            body += chunk.toString();
-                        });
-
-                        req.on('end', () => {
-                            if (totalSize <= MAX_DATA_SIZE) {
-                                const parsedData = querystring.parse(body);
-                                const domain = parsedData.domain;
-
-                                if (!domain) {
-                                    return;
-                                }
-
-                                if (validator.isFQDN(domain)) {
-                                    const cacheExists = resolveCache.get(domain);
-                                    if (cacheExists !== null && cacheExists !== undefined && cacheExists !== '') {
-                                        // Remove the cache entry
-                                        resolveCache.delete(domain);
-                                    }
+                            if (validator.isFQDN(domain)) {
+                                const cacheExists = resolveCache.get(domain);
+                                if (cacheExists) {
+                                    // Remove the cache entry
+                                    resolveCache.delete(domain);
                                 }
                             }
-                        });
-                        res.writeHead(200, { 'Content-Type': 'text/plain' });
-                        res.write("Cache cleared");
-                        return;
-                    }
-                    res.writeHead(405, {'Content-Type': 'text/plain'});
-                    res.write("Method Not Allowed");
+                        }
+                    });
+                    res.writeHead(200, { 'Content-Type': 'text/plain' });
+                    res.write("Cache cleared");
                     return;
             }
 
