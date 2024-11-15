@@ -1,3 +1,5 @@
+404 detect and helper
+
 # Forward Domain
 
 [![GitHub Repo stars](https://img.shields.io/github/stars/willnode/forward-domain?style=for-the-badge)](https://github.com/willnode/forward-domain/stargazers)
